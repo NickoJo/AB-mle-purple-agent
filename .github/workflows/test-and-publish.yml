@@ -6,15 +6,12 @@ on:
     branches:
       - main
     tags:
-      - 'v*'  # Trigger on version tags like v1.0.0, v1.1.0
+      - 'v*'
 
 jobs:
   test-and-publish:
     runs-on: ubuntu-latest
 
-    # These permissions are required for the workflow to:
-    # - Read repository contents (checkout code)
-    # - Write to GitHub Container Registry (push Docker images)
     permissions:
       contents: read
       packages: write
@@ -49,11 +46,13 @@ jobs:
             SECRETS_JSON: ${{ toJson(secrets) }}
         run: |
           echo "$SECRETS_JSON" | jq -r 'to_entries[] | "\(.key)=\(.value)"' > .env
-          docker run -d -p 9009:9009 --name agent-container --env-file .env $(echo "${{ steps.meta.outputs.tags }}" | head -n1) --host 0.0.0.0 --port 9009
+          docker run -d -p 9009:9009 --name agent-container --env-file .env $(echo "${{ steps.meta.outputs.tags }}" | head -n1) --host 0.0.0.0 --port 9009 --card-url http://localhost:9009/
           timeout 30 bash -c 'until curl -sf http://localhost:9009/.well-known/agent-card.json > /dev/null; do sleep 1; done'
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.13"
 
       - name: Install test dependencies
         run: uv sync --extra test
@@ -83,6 +82,7 @@ jobs:
       - name: Output image digest
         if: success() && github.event_name != 'pull_request'
         run: |
-          echo "## Docker Image Published :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "## Docker Image Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Tags:** ${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          
