@@ -16,8 +16,8 @@ from a2a.utils import get_message_text, new_agent_text_message
 from messenger import Messenger
 
 API_KEY = os.environ["OPENROUTER_API_KEY"]
-BASE_URL = "https://openrouter.ai/api/v1"
-MODEL_ID = "qwen/qwen3.6-plus:free"
+BASE_URL = "https://openai.bothub.ru/v1"
+MODEL_ID = "gpt-4o-mini"
 
 _llm = AsyncOpenAI(
     api_key=API_KEY,
