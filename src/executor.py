@@ -13,7 +13,8 @@ from a2a.utils import (
     new_task,
 )
 
-from agent import MLCompetitionAgent as Agent
+from agent import Agent
+
 
 TERMINAL_STATES = {
     TaskState.completed,
