@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import itertools
 import os
 import subprocess
 import sys
@@ -8,153 +9,206 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from openai import AsyncOpenAI
-
+import pandas as pd
 from a2a.server.tasks import TaskUpdater
 from a2a.types import FilePart, FileWithBytes, Message, Part, TaskState, TextPart
 from a2a.utils import get_message_text, new_agent_text_message
-from messenger import Messenger
+from openai import AsyncOpenAI
 
-API_KEY = os.environ["OPENROUTER_API_KEY"]
-BASE_URL = "https://openai.bothub.ru/v1"
-MODEL_ID = "gpt-4o-mini"
 
-_llm = AsyncOpenAI(
-    api_key=API_KEY,
-    base_url=BASE_URL,
+client = AsyncOpenAI(
+    api_key=os.environ["OPENROUTER_API_KEY"],
+    base_url="https://openrouter.ai/api/v1",
 )
 
-_MAX_TOKENS = 3000
-_SCRIPT_TIMEOUT = 300
-_MAX_FILES_LISTED = 30
-_DESCRIPTION_PREVIEW = 3000
-_SAMPLE_PREVIEW = 500
-_TRAIN_PREVIEW = 1000
-_ERR_TAIL = 2000
-_STDOUT_TAIL = 500
-_ERR_TAIL_SHORT = 1000
+MODEL = "qwen/qwen3.6-plus:free"
+
+GENERATE_CODE_PROMPT = """## ROLE
+You are an expert ML engineer. Your task is to write a Python solution for a Kaggle-style competition.
+
+## CONTEXT
+### Competition instructions
+{instructions}
+{description_info}
+
+### Available files (absolute paths on disk)
+{files_info}
+
+### Key paths
+- Data directory: {data_dir}
+- Output path: {workdir}/submission.csv
+
+### Data preview
+{train_info}
+{sample_info}
+
+## STEPS
+1. Load train and test data from {data_dir}/
+2. Preprocess: handle missing values with fillna or SimpleImputer
+3. Train a model — prefer LightGBM or XGBoost, fall back to RandomForest if unavailable
+4. Generate predictions on test data
+5. Save predictions to {workdir}/submission.csv matching the exact format of sample_submission.csv
+
+## CONSTRAINTS
+- Use only absolute paths as listed above; never use /workdir or relative paths
+- Available libraries: pandas, numpy, scikit-learn, lightgbm, xgboost
+
+## OUTPUT
+Output ONLY raw Python code — no markdown fences, no explanation, no comments outside the code.
+"""
+
+FIX_CODE_PROMPT = """## ROLE
+You are an expert ML engineer debugging a broken Python script.
+
+## CONTEXT
+### Error output
+{stderr}
+
+### Standard output
+{stdout}
+
+### Original code
+{code}
+
+## STEPS
+1. Identify the root cause of the error
+2. Fix the issue while keeping the original logic intact
+3. Ensure data is read from {workdir}/home/data/ and predictions are saved to {workdir}/submission.csv
+4. Use only absolute paths; never use /workdir or relative paths
+
+## OUTPUT
+Output ONLY the fixed raw Python code — no markdown fences, no explanation.
+"""
 
 
-def _strip_fences(text: str) -> str:
-    for fence in ("```python", "```"):
-        text = text.replace(fence, "")
-    return text.strip()
-
-
-def _read_first_match(pattern: str, root: Path, max_chars: int, label: str) -> str:
-    for path in root.rglob(pattern):
-        try:
-            return f"\n{label}:\n{path.read_text()[:max_chars]}"
-        except Exception:
-            pass
-    return ""
-
-
-class MLCompetitionAgent:
-    def __init__(self) -> None:
-        self.messenger = Messenger()
-        self._workspace: Path | None = None
-        self._tmp_dir = None
-        self._task_description: str = ""
+class Agent:
+    def __init__(self):
+        self._workdir: Path | None = None
+        self._workdir_obj = None  # держим tempfile объект живым
+        self._instructions: str = ""
+        self._deps_installed: bool = False
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
-        content = get_message_text(message)
-        if "validate" in content.lower() and self._workspace is not None:
-            await self._validate_submission(message, updater)
-        else:
-            await self._solve_competition(message, updater)
+        text = get_message_text(message)
 
-    # ------------------------------------------------------------------
-    # Validation flow
-    # ------------------------------------------------------------------
+        # Если green просит валидацию — обрабатываем отдельно
+        if "validate" in text.lower() and self._workdir:
+            await self._handle_validation(message, updater)
+            return
 
-    async def _validate_submission(self, message: Message, updater: TaskUpdater) -> None:
-        assert self._workspace is not None
+        # Иначе — основной флоу: получить датасет и решить задачу
+        await self._handle_main_task(message, updater)
+
+    async def _handle_validation(self, message: Message, updater: TaskUpdater) -> None:
+        """Валидируем submission.csv который прислал green-агент."""
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message("Checking submission file..."),
+            new_agent_text_message("Validating submission..."),
         )
 
-        raw = self._extract_file_bytes(message)
-        if raw is None:
+        submission_data = None
+        for part in message.parts:
+            if isinstance(part.root, FilePart):
+                file_data = part.root.file
+                if isinstance(file_data, FileWithBytes):
+                    submission_data = base64.b64decode(file_data.bytes)
+                    break
+
+        if not submission_data:
             await updater.add_artifact(
-                parts=[Part(root=TextPart(text="Error: submission file is missing"))],
+                parts=[Part(root=TextPart(text="Error: No submission file provided"))],
                 name="validation_result",
             )
             return
 
-        csv_path = self._workspace / "candidate_submission.csv"
-        csv_path.write_bytes(raw)
+        # Сохраняем и проверяем базово
+        val_path = self._workdir / "validate_input.csv"
+        val_path.write_bytes(submission_data)
 
         try:
-            import pandas as pd
-            frame = pd.read_csv(csv_path)
-            outcome = f"OK — {len(frame)} rows, columns: {list(frame.columns)}"
-        except Exception as exc:
-            outcome = f"Rejected — {exc}"
+            df = pd.read_csv(val_path)
+            result = f"Valid submission: {len(df)} rows, columns: {list(df.columns)}"
+        except Exception as e:
+            result = f"Invalid submission: {e}"
 
         await updater.add_artifact(
-            parts=[Part(root=TextPart(text=outcome))],
+            parts=[Part(root=TextPart(text=result))],
             name="validation_result",
         )
 
-    # ------------------------------------------------------------------
-    # Main competition flow
-    # ------------------------------------------------------------------
-
-    async def _solve_competition(self, message: Message, updater: TaskUpdater) -> None:
+    async def _handle_main_task(self, message: Message, updater: TaskUpdater) -> None:
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message("Processing incoming task..."),
+            new_agent_text_message("Received task, extracting data..."),
         )
 
-        description, archive = self._unpack_message(message)
+        instructions = ""
+        tar_bytes = None
 
-        if archive is None:
+        for part in message.parts:
+            if isinstance(part.root, TextPart):
+                instructions += part.root.text + "\n"
+            elif isinstance(part.root, FilePart):
+                file_data = part.root.file
+                if isinstance(file_data, FileWithBytes):
+                    tar_bytes = base64.b64decode(file_data.bytes)
+
+        if not tar_bytes:
             await updater.update_status(
                 TaskState.failed,
-                new_agent_text_message("Expected a tar.gz dataset — none found"),
+                new_agent_text_message("No dataset tar.gz found in message"),
             )
             return
 
-        self._tmp_dir = tempfile.TemporaryDirectory()
-        self._workspace = Path(self._tmp_dir.name)
-        self._task_description = description
+        # Создаём постоянную tmpdir (живёт пока живёт агент)
+        self._workdir_obj = tempfile.TemporaryDirectory()
+        self._workdir = Path(self._workdir_obj.name)
+        self._instructions = instructions
 
+        # Распаковываем
         try:
-            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
-                tar.extractall(self._workspace)
-        except Exception as exc:
+            with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
+                tar.extractall(self._workdir)
+        except Exception as e:
             await updater.update_status(
                 TaskState.failed,
-                new_agent_text_message(f"Could not unpack archive: {exc}"),
+                new_agent_text_message(f"Failed to extract tar: {e}"),
             )
             return
 
-        data_root = self._workspace / "home" / "data"
-        if not data_root.exists():
-            data_root = self._workspace
+        data_dir = self._workdir / "home" / "data"
+        if not data_dir.exists():
+            data_dir = self._workdir
 
-        file_listing = self._build_file_listing(data_root)
+        files_list = [
+            str(f.relative_to(self._workdir))
+            for f in itertools.islice(
+                (f for f in sorted(data_dir.rglob("*")) if f.is_file()), 30
+            )
+        ]
+        files_info = "\n".join(files_list)
 
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message(f"Dataset ready:\n{file_listing}\n\nBuilding solution..."),
+            new_agent_text_message(f"Files extracted:\n{files_info}\n\nGenerating solution..."),
         )
 
-        competition_desc = _read_first_match("description.md", data_root, _DESCRIPTION_PREVIEW, "COMPETITION DESCRIPTION")
-        sample_csv = _read_first_match("sample_submission*", data_root, _SAMPLE_PREVIEW, "Sample submission format")
-        train_csv = _read_first_match("train.csv", data_root, _TRAIN_PREVIEW, "Training data preview")
+        # Читаем превью данных
+        description_info = self._read_first_file(data_dir, "description.md", 3000, "\nCOMPETITION DESCRIPTION:\n")
+        sample_info = self._read_first_file(data_dir, "sample_submission*", 500, "\nSample submission:\n")
+        train_info = self._read_first_file(data_dir, "train.csv", 1000, "\nTrain preview (first rows):\n")
 
-        script = await self._compose_solution(file_listing, sample_csv, train_csv, data_root, competition_desc)
+        # Генерируем код
+        code = await self._generate_code(files_info, sample_info, train_info, data_dir, description_info)
 
-        submission_bytes = await self._execute_with_retry(script, updater)
+        # Запускаем
+        submission_bytes = await self._run_with_retry(code, updater)
         if submission_bytes is None:
             return
 
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message("Predictions generated, uploading..."),
+            new_agent_text_message("Solution done! Submitting..."),
         )
 
         await updater.add_artifact(
@@ -168,146 +222,99 @@ class MLCompetitionAgent:
             name="submission",
         )
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _read_first_file(directory: Path, pattern: str, limit: int, prefix: str = "") -> str:
+        for f in directory.rglob(pattern):
+            try:
+                return prefix + f.read_text()[:limit]
+            except Exception:
+                pass
+        return ""
 
     @staticmethod
-    def _extract_file_bytes(message: Message) -> bytes | None:
-        for part in message.parts:
-            if isinstance(part.root, FilePart):
-                f = part.root.file
-                if isinstance(f, FileWithBytes):
-                    return base64.b64decode(f.bytes)
-        return None
+    def _strip_code_fences(code: str) -> str:
+        for marker in ["```python", "```"]:
+            code = code.replace(marker, "")
+        return code.strip()
 
-    @staticmethod
-    def _unpack_message(message: Message) -> tuple[str, bytes | None]:
-        text_parts: list[str] = []
-        archive: bytes | None = None
-        for part in message.parts:
-            if isinstance(part.root, TextPart):
-                text_parts.append(part.root.text)
-            elif isinstance(part.root, FilePart):
-                f = part.root.file
-                if isinstance(f, FileWithBytes):
-                    archive = base64.b64decode(f.bytes)
-        return "\n".join(text_parts), archive
-
-    def _build_file_listing(self, data_root: Path) -> str:
-        assert self._workspace is not None
-        entries = [
-            str(p.relative_to(self._workspace))
-            for p in sorted(data_root.rglob("*"))[:_MAX_FILES_LISTED]
-            if p.is_file()
-        ]
-        return "\n".join(entries)
-
-    async def _compose_solution(
-        self,
-        file_listing: str,
-        sample_csv: str,
-        train_csv: str,
-        data_root: Path,
-        competition_desc: str = "",
-    ) -> str:
-        sections = [
-            "You are solving a machine learning competition. Write a Python script that trains a model and produces a submission file.",
-            f"## Competition task\n{self._task_description.strip()}",
-        ]
-        if competition_desc.strip():
-            sections.append(competition_desc.strip())
-        sections += [
-            f"## File system layout\nAll paths are absolute.\n{file_listing}",
-            f"## Paths\nInput data directory: {data_root}\nOutput file: {self._workspace}/submission.csv",
-        ]
-        if train_csv.strip():
-            sections.append(train_csv.strip())
-        if sample_csv.strip():
-            sections.append(sample_csv.strip())
-        sections.append(
-            "## Requirements\n"
-            f"1. Load data from `{data_root}/`.\n"
-            "2. Train a model. Use LightGBM or XGBoost when possible; fall back to RandomForest.\n"
-            "3. Impute or fill all missing values before fitting.\n"
-            f"4. Save predictions to `{self._workspace}/submission.csv` using the exact columns from the sample submission.\n"
-            "5. Only use: pandas, numpy, scikit-learn, lightgbm, xgboost.\n"
-            "6. Use the absolute paths shown above — never `/workdir` or relative paths.\n"
-            "7. Output raw Python only — no markdown fences, no prose."
+    async def _generate_code(self, files_info: str, sample_info: str, train_info: str, data_dir: Path, description_info: str = "") -> str:
+        prompt = GENERATE_CODE_PROMPT.format(
+            instructions=self._instructions,
+            description_info=description_info,
+            files_info=files_info,
+            data_dir=data_dir,
+            workdir=self._workdir,
+            train_info=train_info,
+            sample_info=sample_info,
         )
-        prompt = "\n\n".join(sections)
-        resp = await _llm.chat.completions.create(
-            model=_MODEL_ID,
+        response = await client.chat.completions.create(
+            model=MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=_MAX_TOKENS,
+            max_tokens=3000,
         )
-        return _strip_fences(resp.choices[0].message.content)
+        return self._strip_code_fences(response.choices[0].message.content)
 
-    async def _run_script(self, code: str) -> subprocess.CompletedProcess:
-        assert self._workspace is not None
-        script_file = self._workspace / "solve.py"
-        script_file.write_text(code)
+    async def _run_code(self, code: str) -> subprocess.CompletedProcess:
+        script_path = self._workdir / "solution.py"
+        script_path.write_text(code)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
-        await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-q", "scikit-learn", "pandas", "numpy"],
-                capture_output=True,
-            ),
-        )
+        if not self._deps_installed:
+            await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-q",
+                     "scikit-learn", "pandas", "numpy"],
+                    capture_output=True,
+                ),
+            )
+            self._deps_installed = True
 
         return await loop.run_in_executor(
             None,
             lambda: subprocess.run(
-                [sys.executable, str(script_file)],
+                [sys.executable, str(script_path)],
                 capture_output=True,
                 text=True,
-                timeout=_SCRIPT_TIMEOUT,
-                env={**os.environ, "WORKDIR": str(self._workspace)},
+                timeout=300,
+                env={**os.environ, "WORKDIR": str(self._workdir)},
             ),
         )
 
-    async def _execute_with_retry(self, code: str, updater: TaskUpdater) -> bytes | None:
-        assert self._workspace is not None
-        result = await self._run_script(code)
-        output_csv = self._workspace / "submission.csv"
+    async def _run_with_retry(self, code: str, updater: TaskUpdater) -> bytes | None:
+        result = await self._run_code(code)
+        submission_path = self._workdir / "submission.csv"
 
-        if result.returncode == 0 and output_csv.exists():
-            return output_csv.read_bytes()
+        if result.returncode == 0 and submission_path.exists():
+            return submission_path.read_bytes()
 
+        # Пробуем починить
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message("Initial run failed — attempting a fix..."),
+            new_agent_text_message("First attempt failed, fixing..."),
         )
 
-        fix_prompt = "\n\n".join([
-            "A Python ML script failed at runtime. Fix it so it runs without errors.",
-            f"## Stderr\n{result.stderr[-_ERR_TAIL:]}",
-            f"## Stdout\n{result.stdout[-_STDOUT_TAIL:]}",
-            f"## Script\n{code}",
-            (
-                f"Data directory: {self._workspace}/home/data/\n"
-                f"Output file: {self._workspace}/submission.csv\n"
-                "Rules: absolute paths only (no /workdir, no relative paths); "
-                "return raw Python only, no markdown fences."
-            ),
-        ])
-        fix_resp = await _llm.chat.completions.create(
-            model=_MODEL_ID,
+        fix_prompt = FIX_CODE_PROMPT.format(
+            stderr=result.stderr[-2000:],
+            stdout=result.stdout[-500:],
+            code=code,
+            workdir=self._workdir,
+        )
+        fix_response = await client.chat.completions.create(
+            model=MODEL,
             messages=[{"role": "user", "content": fix_prompt}],
-            max_tokens=_MAX_TOKENS,
+            max_tokens=3000,
         )
-        fixed = _strip_fences(fix_resp.choices[0].message.content)
+        fixed_code = self._strip_code_fences(fix_response.choices[0].message.content)
 
-        result2 = await self._run_script(fixed)
+        result2 = await self._run_code(fixed_code)
 
-        if result2.returncode == 0 and output_csv.exists():
-            return output_csv.read_bytes()
+        if result2.returncode == 0 and submission_path.exists():
+            return submission_path.read_bytes()
 
         await updater.update_status(
             TaskState.failed,
-            new_agent_text_message(f"Still failing after fix attempt.\n{result2.stderr[-_ERR_TAIL_SHORT:]}"),
+            new_agent_text_message(f"Failed after retry.\nError: {result2.stderr[-1000:]}"),
         )
         return None
