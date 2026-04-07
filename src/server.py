@@ -25,30 +25,19 @@ def main():
     
     skill = AgentSkill(
         id="mle-bench",
-        name="MLE-Bench Evaluation",
-        description="Evaluates an ML coding agent on a Kaggle competition from the MLE-Bench benchmark.",
-        tags=["mle-bench", "kaggle", "machine-learning", "evaluation"],
-        examples=[
-            """
-                {
-                    "participants": {
-                        "agent": "http://localhost:8000/"
-                    },
-                    "config": {
-                        "competition_id": "spaceship-titanic"
-                    }
-                }
-            """
-        ]
+        name="MLE-Bench Solver",
+        description="Solves Kaggle ML competitions: trains models, generates predictions, returns submission.csv",
+        tags=["machine-learning", "kaggle", "tabular", "prediction"],
+        examples=["Solve this Kaggle competition and return submission.csv"]
     )
 
     agent_card = AgentCard(
-        name="MLE-Bench Purple",
-        description="MLE-Bench Kaggle competition solver via A2A.",
+        name="Purple MLE-Bench Agent",
+        description="An agent that solves Kaggle competitions from the MLE-Bench benchmark using LightGBM/XGBoost/scikit-learn.",
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version='1.0.0',
-        default_input_modes=['text'],
-        default_output_modes=['text'],
+        default_input_modes=['text', 'file'],
+        default_output_modes=['text', 'file'],
         capabilities=AgentCapabilities(streaming=True),
         skills=[skill]
     )
@@ -60,7 +49,6 @@ def main():
     server = A2AStarletteApplication(
         agent_card=agent_card,
         http_handler=request_handler,
-        max_content_length=None
     )
     uvicorn.run(server.build(), host=args.host, port=args.port)
 

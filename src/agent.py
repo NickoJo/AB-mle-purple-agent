@@ -21,7 +21,7 @@ client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
 )
 
-MODEL = "z-ai/glm-4.5-air:free"
+MODEL = "qwen/qwen3.6-plus:free"
 
 GENERATE_CODE_PROMPT = """## ROLE
 You are an expert ML engineer. Your task is to write a Python solution for a Kaggle-style competition.
