@@ -16,7 +16,7 @@
   },
 
   program: {
-    image: "ghcr.io/nickojo/AB-mle-bench-purple:latest",
+    image: "ghcr.io/nickojo/AB-mle-purple-agent:latest",
     entrypoint: "uv run python src/server.py --host 0.0.0.0 --port 9010",
 
     env: {
